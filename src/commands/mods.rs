@@ -8,22 +8,22 @@ use modio::mods::filters::Popular;
 use modio::mods::{Mod, Statistics};
 use serde::{Deserialize, Serialize};
 use twilight_model::application::command::{Command, CommandType};
-use twilight_model::application::component::button::ButtonStyle;
-use twilight_model::application::component::{ActionRow, Button, Component};
 use twilight_model::application::interaction::application_command::{
     CommandData, CommandDataOption, CommandOptionValue,
 };
 use twilight_model::application::interaction::message_component::MessageComponentInteractionData;
 use twilight_model::application::interaction::Interaction;
-use twilight_model::channel::embed::{Embed, EmbedField};
-use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
+use twilight_model::channel::message::component::{ActionRow, Button, ButtonStyle, Component};
+use twilight_model::channel::message::embed::{Embed, EmbedField};
 use twilight_util::builder::command::{CommandBuilder, StringBuilder};
 use twilight_util::builder::embed::{
     EmbedAuthorBuilder, EmbedBuilder, EmbedFooterBuilder, ImageSource,
 };
-use twilight_util::builder::InteractionResponseDataBuilder;
 
-use super::{create_response, EphemeralMessage, InteractionResponseBuilderExt};
+use super::{
+    create_response, defer_component_response, defer_response, update_response_content,
+    EphemeralMessage,
+};
 use crate::bot::Context;
 use crate::error::Error;
 use crate::util::format_timestamp;
@@ -56,6 +56,9 @@ pub async fn list(
 ) -> Result<(), Error> {
     let mut search = None;
     let mut game_id = None;
+
+    defer_response(ctx, interaction).await?;
+
     for opt in &command.options {
         match &opt.value {
             CommandOptionValue::String(s) if opt.name == "mod" => {
@@ -79,14 +82,13 @@ pub async fn list(
         interaction.guild_id.and_then(|id| settings.game(id.get()))
     });
 
-    let mut builder = InteractionResponseDataBuilder::new();
     if let Some(id) = game_id {
         let (filter, title): (Filter, Cow<'_, _>) = if let Some(search) = search {
             match search.parse::<u32>() {
                 Ok(id) => (Id::eq(id), "Mods".into()),
                 Err(_) => (
                     Fulltext::eq(search),
-                    format!("Mods matching: '{}'", search).into(),
+                    format!("Mods matching: '{search}'").into(),
                 ),
             }
         } else {
@@ -103,38 +105,45 @@ pub async fn list(
             .await?;
 
         if let Some(page) = first_page {
-            match page.as_slice() {
+            let (embeds, components) = match page.as_slice() {
                 [mod_] => {
                     let game = game.get().await?;
                     let embed = create_mod_embed(&game, mod_).build();
-                    builder = builder.embeds([embed]);
+                    (Some(vec![embed]), None)
                 }
                 list => {
                     let embed = create_list_embed(list, &title, page.current(), page.page_count());
 
                     let components = if page.total() > page.len() {
-                        Some(create_browse_buttons(
+                        Some(vec![create_browse_buttons(
                             id,
                             search.map(String::as_str),
                             0,
                             20,
                             page.current(),
                             page.page_count(),
-                        ))
+                        )])
                     } else {
                         None
                     };
-                    builder = builder.embeds([embed]).components(components);
+                    (Some(vec![embed]), components)
                 }
-            }
+            };
+            ctx.interaction()
+                .update_response(&interaction.token)
+                .embeds(embeds.as_deref())?
+                .components(components.as_deref())?
+                .await?;
         } else {
-            builder = builder.ephemeral("no mods found.");
+            let content = "No mods found.";
+            update_response_content(ctx, interaction, content).await?;
         }
     } else {
-        builder = builder.ephemeral("default game is not set.");
+        let content = "Default game is not set.";
+        update_response_content(ctx, interaction, content).await?;
     }
 
-    create_response(ctx, interaction, builder.build()).await
+    Ok(())
 }
 
 #[derive(Deserialize, Serialize)]
@@ -169,7 +178,7 @@ pub async fn list_component(
     let (filter, title): (Filter, Cow<'_, _>) = if let Some(search) = search {
         (
             Fulltext::eq(search),
-            format!("Mods matching: '{}'", search).into(),
+            format!("Mods matching: '{search}'").into(),
         )
     } else {
         (Filter::default(), "Mods".into())
@@ -178,9 +187,10 @@ pub async fn list_component(
     let game = ctx.modio.game(game_id);
     let mods = game.mods();
 
+    defer_component_response(ctx, interaction).await?;
+
     let page = mods.search(filter).paged().await?.try_next().await?;
 
-    let mut builder = InteractionResponseDataBuilder::new();
     if let Some(page) = page {
         let embed = create_list_embed(&page, &title, page.current(), page.page_count());
         let components = create_browse_buttons(
@@ -191,20 +201,12 @@ pub async fn list_component(
             page.current(),
             page.page_count(),
         );
-        builder = builder.embeds([embed]).components([components]);
+        ctx.interaction()
+            .update_response(&interaction.token)
+            .embeds(Some(&[embed]))?
+            .components(Some(&[components]))?
+            .await?;
     }
-
-    ctx.interaction()
-        .create_response(
-            interaction.id,
-            &interaction.token,
-            &InteractionResponse {
-                kind: InteractionResponseType::UpdateMessage,
-                data: Some(builder.build()),
-            },
-        )
-        .exec()
-        .await?;
 
     Ok(())
 }
@@ -214,6 +216,8 @@ pub async fn popular(
     interaction: &Interaction,
     command: &CommandData,
 ) -> Result<(), Error> {
+    defer_response(ctx, interaction).await?;
+
     let game_id = match command.options.as_slice() {
         [CommandDataOption {
             value: CommandOptionValue::String(s),
@@ -221,8 +225,8 @@ pub async fn popular(
         }] => {
             let game = search_game(ctx, s).await?;
             if game.is_none() {
-                let data = "Game not found.".into_ephemeral();
-                return create_response(ctx, interaction, data).await;
+                let content = "Game not found.";
+                return update_response_content(ctx, interaction, content).await;
             }
             game.map(|g| g.id)
         }
@@ -234,7 +238,6 @@ pub async fn popular(
         interaction.guild_id.and_then(|id| settings.game(id.get()))
     });
 
-    let mut builder = InteractionResponseDataBuilder::new();
     if let Some(id) = game_id {
         let filter = with_limit(10).order_by(Popular::desc());
         let game = ctx.modio.game(id);
@@ -242,7 +245,8 @@ pub async fn popular(
         let game = game.get().await?;
 
         if mods.is_empty() {
-            builder = builder.ephemeral("no mods founds.");
+            let content = "No mods founds.";
+            update_response_content(ctx, interaction, content).await?;
         } else {
             let mut content = String::new();
             for mod_ in mods {
@@ -268,13 +272,16 @@ pub async fn popular(
                 )
                 .build();
 
-            builder = builder.embeds([embed]);
+            ctx.interaction()
+                .update_response(&interaction.token)
+                .embeds(Some(&[embed]))?
+                .await?;
         }
     } else {
-        builder = builder.ephemeral("default game is not set.");
+        let content = "Default game is not set.";
+        update_response_content(ctx, interaction, content).await?;
     }
-
-    create_response(ctx, interaction, builder.build()).await
+    Ok(())
 }
 
 async fn search_game(ctx: &Context, search: &str) -> Result<Option<Game>, Error> {
@@ -295,8 +302,7 @@ fn create_list_embed(mods: &[Mod], title: &str, page: usize, page_count: usize) 
         .title(title)
         .description(content)
         .footer(EmbedFooterBuilder::new(format!(
-            "Page: {}/{}",
-            page, page_count,
+            "Page: {page}/{page_count}"
         )))
         .build()
 }
@@ -399,7 +405,7 @@ Votes: +{}/-{}"#,
         let updated = format_timestamp(m.date_updated as i64);
         EmbedField {
             name: "Dates".to_owned(),
-            value: format!("Created: {}\nUpdated: {}", added, updated),
+            value: format!("Created: {added}\nUpdated: {updated}"),
             inline: true,
         }
     }
@@ -410,14 +416,14 @@ Votes: +{}/-{}"#,
             String::new()
         };
         if let Some(homepage) = &m.homepage_url {
-            let _ = write!(info, "[Homepage]({}), ", homepage);
+            let _ = write!(info, "[Homepage]({homepage}), ");
         }
         if let Some(f) = &m.modfile {
             if with_ddl {
                 let _ = writeln!(info, "[Download]({})", f.download.binary_url);
             }
             if let Some(version) = &f.version {
-                let _ = writeln!(info, "Version: {}", version);
+                let _ = writeln!(info, "Version: {version}");
             }
             let _ = writeln!(info, "Size: {}", bytesize::to_string(f.filesize, false));
         }

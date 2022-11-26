@@ -9,6 +9,8 @@ use twilight_http::client::InteractionClient;
 use twilight_http::Client;
 use twilight_model::application::interaction::InteractionData;
 use twilight_model::gateway::event::Event;
+use twilight_model::gateway::payload::outgoing::update_presence::UpdatePresencePayload;
+use twilight_model::gateway::presence::{ActivityType, MinimalActivity, Status};
 use twilight_model::oauth::Application;
 
 use crate::commands;
@@ -42,15 +44,23 @@ pub async fn initialize(
     metrics: Metrics,
 ) -> Result<(Cluster, Events, Context), Error> {
     let client = Arc::new(Client::new(config.bot.token.clone()));
-    let application = client
-        .current_user_application()
-        .exec()
-        .await?
-        .model()
-        .await?;
+    let application = client.current_user_application().await?.model().await?;
 
     let interaction = client.interaction(application.id);
     commands::register(&interaction).await?;
+
+    let presence = UpdatePresencePayload::new(
+        [MinimalActivity {
+            kind: ActivityType::Playing,
+            name: "/help".into(),
+            url: None,
+        }
+        .into()],
+        false,
+        None,
+        Status::Online,
+    )
+    .expect("required activity is provided");
 
     let (cluster, events) = Cluster::builder(config.bot.token.clone(), Intents::GUILDS)
         .event_types(
@@ -59,6 +69,7 @@ pub async fn initialize(
                 | EventTypeFlags::GUILD_DELETE
                 | EventTypeFlags::INTERACTION_CREATE,
         )
+        .presence(presence)
         .http_client(Arc::clone(&client))
         .build()
         .await?;
@@ -90,11 +101,11 @@ pub async fn handle_event(event: Event, context: Context) {
     match event {
         Event::Ready(ready) => {
             let guilds = ready.guilds.iter().map(|g| g.id.get()).collect::<Vec<_>>();
-            tracing::info!("Guilds: {:?}", guilds);
+            tracing::info!("Guilds: {guilds:?}");
             context.metrics.guilds.set(ready.guilds.len() as u64);
 
             if let Err(e) = context.subscriptions.cleanup(&guilds) {
-                tracing::error!("{}", e);
+                tracing::error!("{e}");
             }
             let guilds = ready
                 .guilds
@@ -102,7 +113,7 @@ pub async fn handle_event(event: Event, context: Context) {
                 .map(|g| g.id.get())
                 .collect::<Vec<_>>();
             let data = load_settings(&context.pool, &guilds).unwrap_or_default();
-            tracing::info!("{:?}", data);
+            tracing::info!("{data:?}");
 
             let mut settings = context.settings.lock().unwrap();
             settings.data.extend(data);

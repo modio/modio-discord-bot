@@ -17,11 +17,13 @@ use crate::error::Error;
 
 mod basic;
 mod game;
+mod help;
 pub mod mods;
 mod subs;
 
 fn commands() -> Vec<Command> {
     let mut cmds = Vec::new();
+    cmds.extend(help::commands());
     cmds.extend(basic::commands());
     cmds.extend(game::commands());
     cmds.extend(mods::commands());
@@ -30,13 +32,14 @@ fn commands() -> Vec<Command> {
 }
 
 pub async fn register(client: &InteractionClient<'_>) -> Result<(), Error> {
-    client.set_global_commands(&commands()).exec().await?;
+    client.set_global_commands(&commands()).await?;
     Ok(())
 }
 
 pub async fn handle_command(ctx: &Context, interaction: &Interaction, command: &CommandData) {
     let res = match command.name.as_str() {
         "about" => basic::about(ctx, interaction).await,
+        "help" => help::help(ctx, interaction, command).await,
         "settings" => basic::settings(ctx, interaction, command).await,
         "games" => game::games(ctx, interaction, command).await,
         "game" => game::game(ctx, interaction).await,
@@ -46,7 +49,7 @@ pub async fn handle_command(ctx: &Context, interaction: &Interaction, command: &
         _ => Ok(()),
     };
     if let Err(e) = res {
-        tracing::error!("{}", e);
+        tracing::error!("{e}");
     }
 }
 
@@ -64,7 +67,7 @@ pub async fn handle_component(
         _ => Ok(()),
     };
     if let Err(e) = res {
-        tracing::error!("{}", e);
+        tracing::error!("{e}");
     }
 }
 
@@ -84,6 +87,16 @@ impl EphemeralMessage for String {
     fn into_ephemeral(self) -> InteractionResponseData {
         InteractionResponseDataBuilder::new()
             .ephemeral(self)
+            .build()
+    }
+}
+
+impl EphemeralMessage for EmbedBuilder {
+    fn into_ephemeral(self) -> InteractionResponseData {
+        let embed = self.build();
+        InteractionResponseDataBuilder::new()
+            .flags(MessageFlags::EPHEMERAL)
+            .embeds([embed])
             .build()
     }
 }
@@ -109,12 +122,69 @@ async fn create_response(
     };
     ctx.interaction()
         .create_response(interaction.id, &interaction.token, &response)
-        .exec()
         .await?;
     Ok(())
 }
 
-async fn create_responses_from_content(
+async fn defer_ephemeral(ctx: &Context, interaction: &Interaction) -> Result<(), Error> {
+    ctx.interaction()
+        .create_response(
+            interaction.id,
+            &interaction.token,
+            &InteractionResponse {
+                kind: InteractionResponseType::DeferredChannelMessageWithSource,
+                data: Some(
+                    InteractionResponseDataBuilder::new()
+                        .flags(MessageFlags::EPHEMERAL)
+                        .build(),
+                ),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+async fn defer_response(ctx: &Context, interaction: &Interaction) -> Result<(), Error> {
+    ctx.interaction()
+        .create_response(
+            interaction.id,
+            &interaction.token,
+            &InteractionResponse {
+                kind: InteractionResponseType::DeferredChannelMessageWithSource,
+                data: None,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+async fn defer_component_response(ctx: &Context, interaction: &Interaction) -> Result<(), Error> {
+    ctx.interaction()
+        .create_response(
+            interaction.id,
+            &interaction.token,
+            &InteractionResponse {
+                kind: InteractionResponseType::DeferredUpdateMessage,
+                data: None,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+async fn update_response_content(
+    ctx: &Context,
+    interaction: &Interaction,
+    content: &str,
+) -> Result<(), Error> {
+    ctx.interaction()
+        .update_response(&interaction.token)
+        .content(Some(content))?
+        .await?;
+    Ok(())
+}
+
+async fn update_response_from_content(
     ctx: &Context,
     interaction: &Interaction,
     title: &str,
@@ -127,9 +197,10 @@ async fn create_responses_from_content(
             .description(content)
             .build();
 
-        let data = InteractionResponseDataBuilder::new().embeds([embed]);
-
-        create_response(ctx, interaction, data.build()).await?;
+        ctx.interaction()
+            .update_response(&interaction.token)
+            .embeds(Some(&[embed]))?
+            .await?;
 
         for content in contents {
             let embed = EmbedBuilder::new()
@@ -140,7 +211,6 @@ async fn create_responses_from_content(
             ctx.interaction()
                 .create_followup(&interaction.token)
                 .embeds(&[embed])?
-                .exec()
                 .await?;
         }
     }

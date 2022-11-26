@@ -1,17 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashSet;
 use futures_util::stream::FuturesUnordered;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::TryStreamExt;
 use modio::filter::prelude::*;
 use modio::games::{ApiAccessOptions, Game};
 use modio::mods::filters::events::EventType as EventTypeFilter;
 use modio::mods::{EventType, Mod};
 use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
+use tokio_stream::StreamExt;
 use tracing::{debug, error, trace};
-use twilight_model::channel::embed::Embed;
+use twilight_model::channel::message::embed::Embed;
 use twilight_model::id::Id as ChannelId;
 use twilight_util::builder::embed::{
     EmbedAuthorBuilder, EmbedBuilder, EmbedFieldBuilder, EmbedFooterBuilder, ImageSource,
@@ -23,19 +26,30 @@ use crate::util;
 
 const MIN: Duration = Duration::from_secs(60);
 const INTERVAL_DURATION: Duration = Duration::from_secs(300);
+const THROTTLE: Duration = Duration::from_millis(30);
 
 #[allow(clippy::too_many_lines)]
 pub fn task(ctx: Context) -> impl Future<Output = ()> {
     let (sender, mut receiver) = mpsc::channel::<(BTreeSet<u64>, Option<String>, Embed)>(100);
 
+    let unknown_channels = Arc::new(DashSet::new());
+    let unknown_channels2 = unknown_channels.clone();
+    let subscriptions = ctx.subscriptions.clone();
+
     tokio::spawn(async move {
         loop {
             if let Some((channels, content, embed)) = receiver.recv().await {
-                ctx.metrics.notifications.inc_by(channels.len() as u64);
-
                 let embeds = [embed];
-                let mut cc = channels
+                let messages = channels
                     .into_iter()
+                    .filter(|id| {
+                        if unknown_channels.contains(id) {
+                            tracing::debug!("channel #{id} ignored: unknown channel");
+                            false
+                        } else {
+                            true
+                        }
+                    })
                     .map(|id| {
                         let mut msg = ctx
                             .client
@@ -45,13 +59,26 @@ pub fn task(ctx: Context) -> impl Future<Output = ()> {
                         if let Some(content) = &content {
                             msg = msg.content(content).unwrap();
                         }
-                        msg.exec()
+                        async move { (id, msg.await) }
                     })
                     .collect::<FuturesUnordered<_>>();
 
-                while let Some(ret) = cc.next().await {
+                let messages = messages.throttle(THROTTLE);
+                tokio::pin!(messages);
+
+                while let Some((channel_id, ret)) = messages.next().await {
                     if let Err(e) = ret {
-                        error!("{}", e);
+                        if util::is_unknown_channel_error(e.kind()) {
+                            unknown_channels.insert(channel_id);
+
+                            if let Err(e) = subscriptions.cleanup_unknown_channels(&[channel_id]) {
+                                error!("{e}");
+                            }
+                        } else {
+                            error!("{e}");
+                        }
+                    } else {
+                        ctx.metrics.notifications.inc();
                     }
                 }
             }
@@ -69,6 +96,9 @@ pub fn task(ctx: Context) -> impl Future<Output = ()> {
             let tstamp = tstamp.take().unwrap_or_else(util::current_timestamp);
             interval.tick().await;
 
+            // Clear the unknown channels from the previous workload.
+            unknown_channels2.clear();
+
             let filter = DateAdded::gt(tstamp)
                 .and(EventTypeFilter::_in(vec![
                     EventType::ModfileChanged,
@@ -79,32 +109,42 @@ pub fn task(ctx: Context) -> impl Future<Output = ()> {
                 .order_by(Id::asc());
 
             let subs = ctx.subscriptions.load().unwrap_or_else(|e| {
-                error!("failed to load subscriptions: {}", e);
+                error!("failed to load subscriptions: {e}");
                 HashMap::default()
             });
 
-            for (game, channels) in subs {
+            for (game_id, channels) in subs {
                 if channels.is_empty() {
                     continue;
                 }
-                debug!(
-                    "polling events at {} for game={} channels: {:?}",
-                    tstamp, game, channels
-                );
                 let sender = sender.clone();
+                let unknown_channels = unknown_channels2.clone();
                 let filter = filter.clone();
-                let game = ctx.modio.game(game);
-                let mods = game.mods();
+                let game = ctx.modio.game(game_id);
+                let mods = ctx.modio.game(game_id).mods();
+                let events = ctx.modio.game(game_id).mods().events(filter);
 
                 let task = async move {
                     type Events = BTreeMap<u32, Vec<(u32, EventType)>>;
+
+                    debug!("polling events at {tstamp} for game={game_id} channels: {channels:?}");
+
+                    let game = match game.get().await {
+                        Ok(game) => game,
+                        Err(e) => {
+                            tracing::warn!(
+                                "skipping polling: can't retrieve game (id={game_id}): {e}"
+                            );
+
+                            return Ok(());
+                        }
+                    };
 
                     // - Group the events by mod
                     // - Filter `MODFILE_CHANGED` events for new mods
                     // - Ungroup the events ordered by event id
 
-                    let mut events = mods
-                        .events(filter)
+                    let mut events = events
                         .iter()
                         .await?
                         .try_fold(Events::new(), |mut events, e| async move {
@@ -133,8 +173,7 @@ pub fn task(ctx: Context) -> impl Future<Output = ()> {
 
                     // Load the mods for the events
                     let filter = Id::_in(events.keys().collect::<Vec<_>>());
-                    let events = game
-                        .mods()
+                    let events = mods
                         .search(filter)
                         .iter()
                         .await?
@@ -151,31 +190,33 @@ pub fn task(ctx: Context) -> impl Future<Output = ()> {
                         }
                     }
 
-                    let game = game.get().await?;
-
                     for (_, (m, evt)) in updates {
                         let mut effected_channels = BTreeSet::new();
 
                         for (channel, tags, _, evts, excluded_mods, excluded_users) in &channels {
+                            if unknown_channels.contains(channel) {
+                                debug!("event ignored #{channel}: unknown channel");
+                                continue;
+                            }
                             if *evt == EventType::ModAvailable
                                 && !evts.contains(crate::db::Events::NEW)
                                 || *evt == EventType::ModfileChanged
                                     && !evts.contains(crate::db::Events::UPD)
                             {
-                                debug!("event ignored #{}: {} for {:?}", channel, evt, m.name,);
+                                debug!("event ignored #{channel}: {evt} for {:?}", m.name);
                                 continue;
                             }
                             if excluded_users.contains(&m.submitted_by.username)
                                 || excluded_users.contains(&m.submitted_by.name_id)
                             {
                                 debug!(
-                                    "user ignored #{}: {} for {:?}/{:?}",
-                                    channel, evt, m.submitted_by.name_id, m.name,
+                                    "user ignored #{channel}: {evt} for {:?}/{:?}",
+                                    m.submitted_by.name_id, m.name,
                                 );
                                 continue;
                             }
                             if excluded_mods.contains(&m.id) {
-                                debug!("mod ignored #{}: {} for {:?}", channel, evt, m.name,);
+                                debug!("mod ignored #{channel}: {evt} for {:?}", m.name);
                                 continue;
                             }
                             if !tags.is_empty() {
@@ -186,10 +227,10 @@ pub fn task(ctx: Context) -> impl Future<Output = ()> {
                                     tags.iter().map(|t| t.trim_start_matches('*')).collect();
                                 if !tags.is_subset(&mod_tags) {
                                     debug!(
-                                        "mod ignored based on tags #{}: {} for {:?}",
-                                        channel, evt, m.name
+                                        "mod ignored based on tags #{channel}: {evt} for {:?}",
+                                        m.name
                                     );
-                                    trace!("mod tags: {:?}; sub tags: {:?}", mod_tags, tags);
+                                    trace!("mod tags: {mod_tags:?}; sub tags: {tags:?}");
                                     continue;
                                 }
                             }
@@ -206,7 +247,7 @@ pub fn task(ctx: Context) -> impl Future<Output = ()> {
                         );
                         let (content, embed) = create_mod_message(&game, m, evt);
                         if let Err(e) = sender.send((effected_channels, content, embed)).await {
-                            error!("{}", e);
+                            error!("{e}");
                         }
                     }
                     Ok::<_, modio::Error>(())
@@ -214,7 +255,7 @@ pub fn task(ctx: Context) -> impl Future<Output = ()> {
 
                 tokio::spawn(async {
                     if let Err(e) = task.await {
-                        error!("{}", e);
+                        error!("{e}");
                     }
                 });
             }
@@ -244,16 +285,16 @@ fn create_mod_message(game: &Game, mod_: &Mod, event_type: &EventType) -> (Optio
                     let link = &f.download.binary_url;
                     let no_version = || {
                         if with_ddl {
-                            format!("[Download]({})", link)
+                            format!("[Download]({link})")
                         } else {
                             String::new()
                         }
                     };
                     let version = |v| {
                         if with_ddl {
-                            format!("[Version {}]({})", v, link)
+                            format!("[Version {v}]({link})")
                         } else {
-                            format!("Version {}", v)
+                            format!("Version {v}")
                         }
                     };
                     let download = f
@@ -282,7 +323,7 @@ fn create_mod_message(game: &Game, mod_: &Mod, event_type: &EventType) -> (Optio
                 })
                 .unwrap_or_default();
 
-            let desc = format!("A new version is available. {}", download);
+            let desc = format!("A new version is available. {download}");
             let mut embed = create_embed(game, mod_, &desc, false);
             if let Some(changelog) = changelog {
                 embed = embed.field(changelog);
